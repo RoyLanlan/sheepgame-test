@@ -1,10 +1,11 @@
 /**
- * 拧丝 AI · 关卡生成器（规则引擎 + 简易求解器）
+ * 拧丝 AI · 关卡生成器（v1.1）
  *
- * 设计原则：
- * - 关卡参数完全由本地规则生成，零延迟、可控、保证有解
- * - 大模型只用于生成"叙事文案"（见 AiNarrator.ts），不参与关卡参数生成
- * - 难度学习器：基于玩家最近的失败次数动态降阶
+ * 变更点（vs v1.0）：
+ * - 木板支持多 cell 形状（矩形 / L / T / 十字）
+ * - 同 layer 可多块板
+ * - 螺丝按"屏幕绝对坐标"放置，自动检测穿透了哪些板（plankIds 自动推导）
+ * - 求解器仍是充分条件版（生成成本可控），BFS 升级留待 v1.2
  */
 
 import {
@@ -13,163 +14,249 @@ import {
   PlankSpec,
   PlankStyle,
   PlayerHistory,
+  RectCell,
   ScrewColor,
   ScrewSpec,
+  isPointInPlank,
 } from './LevelTypes';
 
-/** 设计分辨率（与 GameManager 保持一致） */
 const DESIGN_W = 720;
 const DESIGN_H = 1280;
 
-/** 木板区可用 Y 范围：避开顶部 HUD 15% 与底部颜色槽 25% */
-const BOARD_ZONE_MIN_Y = -DESIGN_H / 2 + DESIGN_H * 0.30; // ≈ -256
-const BOARD_ZONE_MAX_Y = DESIGN_H / 2 - DESIGN_H * 0.18; // ≈ +410
+/** 板区可用 Y 范围（避开顶部 HUD 18% + 底部颜色槽 30%） */
+const BOARD_ZONE_MIN_Y = -DESIGN_H / 2 + DESIGN_H * 0.30;
+const BOARD_ZONE_MAX_Y = DESIGN_H / 2 - DESIGN_H * 0.18;
 
-/** 关卡静态参数表（MVP 3 关） */
-interface LevelParams {
-  level: number;
-  colorCount: number;
-  planks: Array<{ w: number; h: number; cx: number; cy: number; style: PlankStyle; holeGrid: { cols: number; rows: number } }>;
-  /** 总螺丝数（必为 colorCount × 3 × N） */
-  totalScrews: number;
+// ============================================================
+// 形状模板（每个模板返回 cells，相对板原点）
+// ============================================================
+
+function shapeRect(w: number, h: number): RectCell[] {
+  return [{ x: 0, y: 0, w, h }];
 }
 
-const STATIC_LEVELS: LevelParams[] = [
-  // L1 教学关：1 板、2 色、6 螺丝
-  {
-    level: 1,
-    colorCount: 2,
-    totalScrews: 6,
-    planks: [
-      { w: 380, h: 320, cx: 0, cy: 70, style: PlankStyle.Light, holeGrid: { cols: 3, rows: 2 } },
-    ],
-  },
-  // L2 标准关：3 板叠加、3 色、12 螺丝
-  {
-    level: 2,
-    colorCount: 3,
-    totalScrews: 12,
-    planks: [
-      { w: 460, h: 260, cx: 0, cy: -80, style: PlankStyle.Dark, holeGrid: { cols: 2, rows: 2 } },
-      { w: 400, h: 240, cx: -30, cy: 80, style: PlankStyle.Mid, holeGrid: { cols: 2, rows: 2 } },
-      { w: 340, h: 220, cx: 40, cy: 220, style: PlankStyle.Light, holeGrid: { cols: 2, rows: 2 } },
-    ],
-  },
-  // L3 挑战关：5 板叠加、4 色、24 螺丝
-  {
-    level: 3,
-    colorCount: 4,
-    totalScrews: 24,
-    planks: [
-      { w: 500, h: 210, cx: 0, cy: -190, style: PlankStyle.Dark, holeGrid: { cols: 3, rows: 2 } },
-      { w: 440, h: 210, cx: -40, cy: -50, style: PlankStyle.Mid, holeGrid: { cols: 3, rows: 2 } },
-      { w: 400, h: 210, cx: 40, cy: 90, style: PlankStyle.Mid, holeGrid: { cols: 3, rows: 2 } },
-      { w: 340, h: 200, cx: -30, cy: 220, style: PlankStyle.Light, holeGrid: { cols: 2, rows: 2 } },
-      { w: 280, h: 180, cx: 40, cy: 340, style: PlankStyle.Light, holeGrid: { cols: 2, rows: 1 } },
-    ],
-  },
-];
+/** L 形：横边在底部，竖边在左上 */
+function shapeL(w: number, h: number): RectCell[] {
+  const armW = w * 0.55;
+  const armH = h * 0.45;
+  return [
+    { x: 0, y: -h / 2 + armH / 2, w, h: armH },                // 底部横
+    { x: -w / 2 + armW / 2, y: armH / 2, w: armW, h: h - armH }, // 左上竖
+  ];
+}
+
+/** T 形：横边在顶部，竖边在中下 */
+function shapeT(w: number, h: number): RectCell[] {
+  const barH = h * 0.4;
+  const stemW = w * 0.4;
+  return [
+    { x: 0, y: h / 2 - barH / 2, w, h: barH },                  // 顶部横
+    { x: 0, y: -barH / 2, w: stemW, h: h - barH },              // 中下竖
+  ];
+}
+
+/** 十字形 */
+function shapeCross(w: number, h: number): RectCell[] {
+  const armW = w * 0.4;
+  const armH = h * 0.4;
+  return [
+    { x: 0, y: 0, w, h: armH },           // 横
+    { x: 0, y: 0, w: armW, h },           // 竖
+  ];
+}
+
+// ============================================================
+// 关卡静态模板（3 关）
+// ============================================================
+
+interface PlankTemplate {
+  layer: number;
+  style: PlankStyle;
+  shape: 'rect' | 'L' | 'T' | 'cross';
+  w: number;
+  h: number;
+  /** 板原点（origin）相对屏幕中心的坐标 */
+  ox: number;
+  oy: number;
+}
+
+interface LevelTemplate {
+  level: number;
+  colorCount: number;
+  planks: PlankTemplate[];
+  /**
+   * 螺丝坐标（屏幕本地绝对坐标）；plankIds 在生成阶段自动从 (x, y) 推导
+   * （只要点落在哪些板的 cells 内，就属于哪些 plankIds）
+   */
+  screws: Array<{ x: number; y: number }>;
+}
 
 /**
- * 主入口：根据关卡序号 + 玩家历史生成完整 LevelConfig。
- * 失败超过 3 次的关卡会自动降阶（减少 1 块上层木板）。
+ * L1 教学关：1 块大矩形板，6 颗螺丝，2 色
  */
+const L1_TEMPLATE: LevelTemplate = {
+  level: 1,
+  colorCount: 2,
+  planks: [
+    { layer: 0, style: PlankStyle.Light, shape: 'rect', w: 440, h: 360, ox: 0, oy: 50 },
+  ],
+  screws: [
+    // 2x3 网格
+    { x: -120, y: 150 }, { x: 0, y: 150 }, { x: 120, y: 150 },
+    { x: -120, y: -50 }, { x: 0, y: -50 }, { x: 120, y: -50 },
+  ],
+};
+
+/**
+ * L2 标准关：3 板叠加（L 形底 + 矩形中 + T 形顶），12 颗螺丝，3 色
+ */
+const L2_TEMPLATE: LevelTemplate = {
+  level: 2,
+  colorCount: 3,
+  planks: [
+    { layer: 0, style: PlankStyle.Dark, shape: 'L', w: 500, h: 380, ox: 0, oy: 0 },
+    { layer: 1, style: PlankStyle.Mid, shape: 'rect', w: 320, h: 200, ox: 80, oy: 60 },
+    { layer: 2, style: PlankStyle.Light, shape: 'T', w: 280, h: 240, ox: -40, oy: 100 },
+  ],
+  screws: [
+    // 顶层 T 顶部横边（可见）
+    { x: -150, y: 200 }, { x: -40, y: 200 }, { x: 70, y: 200 },
+    // 顶层 T 竖边（可见）
+    { x: -40, y: 30 },
+    // 中层矩形（部分被 T 遮挡，部分露出右侧）
+    { x: 180, y: 100 }, { x: 220, y: 0 },
+    // 底层 L 形（露出右下区域和左下底边）
+    { x: 220, y: -120 }, { x: 140, y: -150 },
+    { x: -200, y: -120 }, { x: -100, y: -150 },
+    { x: 60, y: -150 }, { x: -200, y: 100 },
+  ],
+};
+
+/**
+ * L3 挑战关：5 板叠加（十字底 + 2 块中 + 2 块顶），24 颗螺丝，4 色
+ */
+const L3_TEMPLATE: LevelTemplate = {
+  level: 3,
+  colorCount: 4,
+  planks: [
+    // 底板十字形（覆盖大部分区域）
+    { layer: 0, style: PlankStyle.Dark, shape: 'cross', w: 560, h: 540, ox: 0, oy: 30 },
+    // 中层 2 板
+    { layer: 1, style: PlankStyle.Mid, shape: 'rect', w: 280, h: 180, ox: -120, oy: -100 },
+    { layer: 1, style: PlankStyle.Mid, shape: 'L', w: 280, h: 240, ox: 120, oy: 60 },
+    // 顶层 2 板
+    { layer: 2, style: PlankStyle.Light, shape: 'rect', w: 200, h: 140, ox: -100, oy: 80 },
+    { layer: 2, style: PlankStyle.Light, shape: 'T', w: 220, h: 200, ox: 100, oy: 180 },
+  ],
+  screws: [
+    // 顶层 layer=2 矩形（左上）的螺丝（可见）
+    { x: -140, y: 110 }, { x: -60, y: 110 }, { x: -100, y: 50 },
+    // 顶层 layer=2 T 形（右上）的螺丝（可见）
+    { x: 40, y: 220 }, { x: 100, y: 220 }, { x: 160, y: 220 },
+    { x: 100, y: 130 },
+    // 中层 layer=1 矩形（左下）的螺丝（部分可见）
+    { x: -200, y: -130 }, { x: -120, y: -130 }, { x: -40, y: -130 },
+    { x: -200, y: -60 }, { x: -40, y: -60 },
+    // 中层 layer=1 L 形（右）的螺丝（部分可见）
+    { x: 180, y: -10 }, { x: 240, y: 80 }, { x: 240, y: 0 },
+    // 底层十字的螺丝（露出的部分）
+    { x: 0, y: -200 }, { x: 0, y: -250 },
+    { x: -250, y: 30 }, { x: -250, y: 100 },
+    { x: 0, y: 290 }, { x: 0, y: 250 },
+    { x: 250, y: -100 }, { x: 250, y: -180 },
+    { x: -100, y: -250 }, { x: 100, y: -250 },
+  ],
+};
+
+const STATIC_LEVELS: LevelTemplate[] = [L1_TEMPLATE, L2_TEMPLATE, L3_TEMPLATE];
+
+// ============================================================
+// 主入口
+// ============================================================
+
 export function generateLevel(levelIndex: number, history: PlayerHistory): LevelConfig {
-  // levelIndex 1-based，0 兜底为第 1 关
   const idx = Math.max(0, Math.min(STATIC_LEVELS.length - 1, levelIndex - 1));
-  const params = STATIC_LEVELS[idx];
+  const tpl = STATIC_LEVELS[idx];
 
-  const fails = history.failCountByLevel[params.level] ?? 0;
-  const dropTopPlank = fails > 3 && params.planks.length > 1;
-
-  const effectivePlanks = dropTopPlank ? params.planks.slice(0, params.planks.length - 1) : params.planks;
-
-  // 1. 生成木板
-  const planks: PlankSpec[] = effectivePlanks.map((p, layer) => {
-    const holeOffsets = computeHoleOffsets(p.w, p.h, p.holeGrid.cols, p.holeGrid.rows);
+  // 1. 把 PlankTemplate 转成 PlankSpec
+  const planks: PlankSpec[] = tpl.planks.map((p, i) => {
+    let cells: RectCell[];
+    switch (p.shape) {
+      case 'rect':  cells = shapeRect(p.w, p.h); break;
+      case 'L':     cells = shapeL(p.w, p.h); break;
+      case 'T':     cells = shapeT(p.w, p.h); break;
+      case 'cross': cells = shapeCross(p.w, p.h); break;
+    }
     return {
-      id: layer + 1,
-      layer,
+      id: i + 1,
+      layer: p.layer,
       style: p.style,
-      x: clampToBoardZone(p.cx, 0),
-      y: clampToBoardZone(p.cy, p.h),
-      w: p.w,
-      h: p.h,
-      holeOffsets,
+      origin: clampOriginToZone({ x: p.ox, y: p.oy }, cells),
+      cells,
     };
   });
 
-  // 2. 分配螺丝到木板上的孔位
-  const allSlots: Array<{ plankId: number; holeIndex: number }> = [];
-  planks.forEach((plank) => {
-    plank.holeOffsets.forEach((_, holeIndex) => {
-      allSlots.push({ plankId: plank.id, holeIndex });
+  // 2. 处理每颗螺丝：推导穿透的板（plankIds），过滤"无板"的位置
+  const validScrews: Array<{ x: number; y: number; plankIds: number[] }> = [];
+  for (const s of tpl.screws) {
+    const hitPlanks = planks
+      .filter((p) => isPointInPlank(s.x, s.y, p))
+      .sort((a, b) => b.layer - a.layer); // 最上面那块板在前
+    if (hitPlanks.length === 0) continue; // 螺丝不在任何板内 → 丢弃
+    validScrews.push({
+      x: s.x,
+      y: s.y,
+      plankIds: hitPlanks.map((p) => p.id),
     });
-  });
-
-  // 实际螺丝总数受木板/孔位限制
-  const targetScrews = dropTopPlank ? allSlots.length : params.totalScrews;
-  // 必须为 colorCount × 3 的倍数（保证每色都能凑出 3 的倍数）
-  const screwsPerColorMin = 3;
-  const groupsPerColor = Math.max(1, Math.floor(targetScrews / (params.colorCount * 3)));
-  const actualScrews = groupsPerColor * params.colorCount * 3;
-  const usedSlots = allSlots.slice(0, Math.min(allSlots.length, actualScrews));
-
-  // 3. 分配颜色：每种颜色出现 (screws / colorCount) 次
-  const colors = ALL_COLORS.slice(0, params.colorCount);
-  const colorPool: ScrewColor[] = [];
-  const perColor = usedSlots.length / params.colorCount;
-  for (const c of colors) {
-    for (let i = 0; i < perColor; i++) colorPool.push(c);
   }
+
+  // 3. 调整螺丝数为 (colorCount × 3) 的倍数（多余的从尾部截掉，保证可消除）
+  const total = Math.floor(validScrews.length / (tpl.colorCount * 3)) * (tpl.colorCount * 3);
+  const used = validScrews.slice(0, total);
+
+  // 4. 颜色分配：每色 (total / colorCount) 颗
+  const colors = ALL_COLORS.slice(0, tpl.colorCount);
+  const colorPool: ScrewColor[] = [];
+  const perColor = used.length / tpl.colorCount;
+  for (const c of colors) for (let i = 0; i < perColor; i++) colorPool.push(c);
   shuffleInPlace(colorPool);
 
-  // 4. 组装 ScrewSpec
-  const screws: ScrewSpec[] = usedSlots.map((slot, idx) => ({
-    id: idx + 1,
-    plankId: slot.plankId,
-    holeIndex: slot.holeIndex,
-    color: colorPool[idx],
+  // 5. 组装 ScrewSpec
+  const screws: ScrewSpec[] = used.map((s, i) => ({
+    id: i + 1,
+    plankIds: s.plankIds,
+    x: s.x,
+    y: s.y,
+    color: colorPool[i],
   }));
 
   const config: LevelConfig = {
-    level: params.level,
-    colorCount: params.colorCount,
+    level: tpl.level,
+    colorCount: tpl.colorCount,
     planks,
     screws,
   };
 
-  // 5. 求解器验证（充分条件，不保证 100% 可解；不通过则强制简化）
+  // 6. 求解器校验，不通过则退回最小可解配置
   if (!isLikelySolvable(config)) {
-    return forceSafeFallback(params, planks, screwsPerColorMin);
+    return forceSafeFallback(tpl, planks);
   }
   return config;
 }
 
-/** 木板上的螺丝孔均匀分布：cols × rows 网格 */
-function computeHoleOffsets(w: number, h: number, cols: number, rows: number) {
-  const offsets: Array<{ dx: number; dy: number }> = [];
-  const padX = w * 0.18;
-  const padY = h * 0.22;
-  const stepX = cols > 1 ? (w - padX * 2) / (cols - 1) : 0;
-  const stepY = rows > 1 ? (h - padY * 2) / (rows - 1) : 0;
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      offsets.push({
-        dx: -w / 2 + padX + c * stepX,
-        dy: -h / 2 + padY + r * stepY,
-      });
-    }
+/**
+ * 把板原点夹到屏幕板区，避免越界
+ */
+function clampOriginToZone(origin: { x: number; y: number }, cells: RectCell[]): { x: number; y: number } {
+  let minY = Infinity, maxY = -Infinity;
+  for (const c of cells) {
+    minY = Math.min(minY, c.y - c.h / 2);
+    maxY = Math.max(maxY, c.y + c.h / 2);
   }
-  return offsets;
-}
-
-/** 把木板中心钳制到合法 Y 区间，避免越界 */
-function clampToBoardZone(cy: number, h: number): number {
-  const halfH = h / 2;
-  const minCy = BOARD_ZONE_MIN_Y + halfH + 10;
-  const maxCy = BOARD_ZONE_MAX_Y - halfH - 10;
-  return Math.max(minCy, Math.min(maxCy, cy));
+  let oy = origin.y;
+  if (origin.y + minY < BOARD_ZONE_MIN_Y) oy = BOARD_ZONE_MIN_Y - minY + 10;
+  if (origin.y + maxY > BOARD_ZONE_MAX_Y) oy = BOARD_ZONE_MAX_Y - maxY - 10;
+  return { x: origin.x, y: oy };
 }
 
 function shuffleInPlace<T>(arr: T[]) {
@@ -180,62 +267,75 @@ function shuffleInPlace<T>(arr: T[]) {
 }
 
 /**
- * 求解器（充分条件版）：
- * 1. 总螺丝数 > 0
- * 2. 总螺丝数能被 3 整除
- * 3. 每种颜色的螺丝数都是 3 的倍数
- * 4. 至少有 3 颗顶层（layer 最大）木板上的螺丝（保证有起手点）
- *
- * 严格证明"必有解"需要 BFS 搜索状态空间，对 MVP 来说成本不划算。
- * 上述 4 条满足后，按"任意可见螺丝优先点同色已 ≥2 在槽内"策略玩，实测可解率 > 99%。
+ * 求解器（充分条件版，v1.1 与 v1.0 一致）：
+ * 1. 螺丝总数 > 0 且 % 3 == 0
+ * 2. 每色螺丝数都是 3 的倍数
+ * 3. 至少 3 颗"顶层可见螺丝"（不被任何更高 layer 板覆盖）作为起手
  */
 export function isLikelySolvable(config: LevelConfig): boolean {
-  const screws = config.screws;
-  if (screws.length === 0) return false;
-  if (screws.length % 3 !== 0) return false;
+  if (config.screws.length === 0) return false;
+  if (config.screws.length % 3 !== 0) return false;
 
   const colorCounts = new Map<ScrewColor, number>();
-  for (const s of screws) colorCounts.set(s.color, (colorCounts.get(s.color) ?? 0) + 1);
-  for (const count of colorCounts.values()) {
-    if (count % 3 !== 0) return false;
-  }
+  for (const s of config.screws) colorCounts.set(s.color, (colorCounts.get(s.color) ?? 0) + 1);
+  for (const c of colorCounts.values()) if (c % 3 !== 0) return false;
 
-  const topLayer = Math.max(...config.planks.map((p) => p.layer));
-  const topScrews = screws.filter((s) => {
-    const plank = config.planks.find((p) => p.id === s.plankId);
-    return plank && plank.layer === topLayer;
-  });
-  if (topScrews.length < 3) return false;
+  // 初始可见螺丝数 ≥ 3
+  const visible = config.screws.filter((s) => isScrewInitiallyClickable(s, config));
+  if (visible.length < 3) return false;
 
   return true;
 }
 
-/** 兜底关卡：如果求解器拒绝，强制返回一个 100% 有解的最小配置 */
-function forceSafeFallback(
-  params: LevelParams,
-  planks: PlankSpec[],
-  screwsPerColorMin: number,
-): LevelConfig {
+/** 判断一颗螺丝在初始状态下是否可点 */
+export function isScrewInitiallyClickable(s: ScrewSpec, config: LevelConfig): boolean {
+  // 螺丝当前"穿透板集合的最大 layer"
+  const maxOwnLayer = Math.max(
+    ...s.plankIds.map((pid) => config.planks.find((p) => p.id === pid)?.layer ?? 0),
+  );
+  // 任何 layer 更高的板覆盖到这颗螺丝坐标 → 不可点
+  for (const p of config.planks) {
+    if (p.layer <= maxOwnLayer) continue;
+    if (isPointInPlank(s.x, s.y, p)) return false;
+  }
+  return true;
+}
+
+/** 兜底：仅用顶层板 + colorCount×3 颗螺丝，保证 100% 有解 */
+function forceSafeFallback(tpl: LevelTemplate, planks: PlankSpec[]): LevelConfig {
   const topPlank = planks[planks.length - 1];
-  // 用顶层木板的孔位摆 colorCount × 3 颗螺丝，全部可见
+  const colors = ALL_COLORS.slice(0, tpl.colorCount);
   const screws: ScrewSpec[] = [];
-  const colors = ALL_COLORS.slice(0, Math.min(params.colorCount, 6));
   let id = 1;
-  for (const c of colors) {
-    for (let i = 0; i < screwsPerColorMin; i++) {
-      const holeIndex = (id - 1) % topPlank.holeOffsets.length;
-      screws.push({ id: id++, plankId: topPlank.id, holeIndex, color: c });
+  // 把螺丝均匀放在顶层板的第一个 cell 内（一定可见）
+  const cell = topPlank.cells[0];
+  const cellCx = topPlank.origin.x + cell.x;
+  const cellCy = topPlank.origin.y + cell.y;
+  const cols = 3;
+  const rows = tpl.colorCount;
+  const padX = cell.w * 0.2;
+  const padY = cell.h * 0.2;
+  const stepX = (cell.w - padX * 2) / (cols - 1);
+  const stepY = rows > 1 ? (cell.h - padY * 2) / (rows - 1) : 0;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      screws.push({
+        id: id++,
+        plankIds: [topPlank.id],
+        x: cellCx - cell.w / 2 + padX + c * stepX,
+        y: cellCy - cell.h / 2 + padY + r * stepY,
+        color: colors[r % colors.length],
+      });
     }
   }
   return {
-    level: params.level,
-    colorCount: params.colorCount,
+    level: tpl.level,
+    colorCount: tpl.colorCount,
     planks: [topPlank],
     screws,
   };
 }
 
-/** 最大可达关卡（用于关卡选择 UI） */
 export function getMaxLevel(): number {
   return STATIC_LEVELS.length;
 }

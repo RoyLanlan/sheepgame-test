@@ -1,9 +1,11 @@
 /**
- * 拧丝 AI · 关卡数据类型定义
+ * 拧丝 AI · 关卡数据类型定义（v1.1）
  *
- * 设计原则：
- * - 纯数据类型，零 Cocos 依赖，便于在 GameManager / LevelGenerator / BoardManager 之间安全传递
- * - 所有坐标都是"设计分辨率 720×1280 下、以屏幕中心为原点"的本地坐标
+ * 设计变更（vs v1.0）：
+ * - PlankSpec 改为 "轴对齐矩形单元集合"，可表达 矩形/L/T/十字/阶梯等任意形状
+ * - 同 layer 可有多块板，互不重叠或部分重叠均允许
+ * - ScrewSpec.plankIds 表达"一颗螺丝穿透多块板"（按 layer 降序）
+ * - 螺丝坐标改为屏幕本地绝对坐标，与板解耦
  */
 
 /** 6 种螺丝颜色（编号即唯一 ID） */
@@ -35,45 +37,63 @@ export const COLOR_HEX: Record<ScrewColor, string> = {
   [ScrewColor.Purple]: '#9B65D8',
 };
 
-/** 木板纹理风格（MVP 仅用色块区分） */
+/** 木板纹理风格 */
 export enum PlankStyle {
   Light = 0,
   Mid = 1,
   Dark = 2,
 }
 
+/** 轴对齐矩形单元（cell 的中心点为 (x, y)，宽 w 高 h） */
+export interface RectCell {
+  /** cell 中心点相对板原点的 X 偏移 */
+  x: number;
+  /** cell 中心点相对板原点的 Y 偏移 */
+  y: number;
+  w: number;
+  h: number;
+}
+
 /**
- * 木板生成参数
- * - layer：层级，0 = 最底层，数值越大越靠上（越后摆放、越先被拧光）
- * - x/y：木板中心点的屏幕本地坐标
- * - w/h：木板宽高（像素）
- * - holeOffsets：木板上每个螺丝孔相对板中心的偏移坐标
+ * 木板规格（v1.1）
+ *
+ * 板由若干轴对齐矩形单元（cells）组成，cells 的并集就是板的形状。
+ * 单 cell = 矩形板；多 cell 组合 = L / T / 十字 / 阶梯 / 不规则板。
+ *
+ * 例：L 形板可以由 2 个 cell 组成：
+ *   横边 cell：x=0, y=0, w=200, h=80
+ *   竖边 cell：x=-60, y=80, w=80, h=120
  */
 export interface PlankSpec {
   id: number;
   layer: number;
   style: PlankStyle;
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  holeOffsets: Array<{ dx: number; dy: number }>;
+  /** 板原点（所有 cells 的坐标都相对此点）在屏幕本地坐标系中的位置 */
+  origin: { x: number; y: number };
+  /** 矩形单元数组，长度 ≥ 1；并集表示整个板的形状 */
+  cells: RectCell[];
 }
 
 /**
- * 螺丝生成参数
- * - plankId：所属木板 ID
- * - holeIndex：在该木板 holeOffsets 数组中的索引（用于定位最终位置）
- * - color：颜色（决定进哪个颜色槽）
+ * 螺丝规格（v1.1）
+ *
+ * 一颗螺丝可同时固定多块板（穿透 plankIds）。
+ * 拧出螺丝 → 从所有 plankIds 板的"未拧螺丝集合"中移除自己；
+ * 当某板的"未拧螺丝集合"为空 → 该板触发掉落 → 销毁 → 重算遮挡。
+ *
+ * 螺丝位置为屏幕本地绝对坐标，与任何板都不耦合（板掉落时螺丝早已飞走）。
  */
 export interface ScrewSpec {
   id: number;
-  plankId: number;
-  holeIndex: number;
+  /** 该螺丝穿透固定的板的 ID 集合，按 layer 降序（最上面那块板在前） */
+  plankIds: number[];
+  /** 屏幕本地绝对坐标 */
+  x: number;
+  y: number;
   color: ScrewColor;
 }
 
-/** 完整关卡配置（由 LevelGenerator 产出） */
+/** 完整关卡配置 */
 export interface LevelConfig {
   /** 关卡序号（从 1 开始） */
   level: number;
@@ -83,25 +103,18 @@ export interface LevelConfig {
   screws: ScrewSpec[];
 }
 
-/** AI 叙事（由 AiNarrator 产出，含本地兜底） */
+/** AI 叙事（不变） */
 export interface LevelNarrative {
-  /** 关卡名，例："拧下时光机的最后一颗螺丝" */
   title: string;
-  /** 30 字微叙事 */
   story: string;
-  /** 通关时显示的一句鼓励 */
   encourage: string;
-  /** 来源：ai = 大模型，fallback = 本地兜底池 */
   source: 'ai' | 'fallback';
 }
 
-/** 玩家历史档案（用于难度学习器 + 续玩） */
+/** 玩家历史档案（不变） */
 export interface PlayerHistory {
-  /** 全局最高到达过的关卡 */
   bestLevel: number;
-  /** 各关最佳通关耗时（秒）；未通过为 0 */
   bestTimeByLevel: Record<number, number>;
-  /** 各关失败次数（用于动态降难度） */
   failCountByLevel: Record<number, number>;
 }
 
@@ -111,4 +124,45 @@ export function emptyHistory(): PlayerHistory {
     bestTimeByLevel: {},
     failCountByLevel: {},
   };
+}
+
+// ============================================================
+// 几何工具（v1.1 新增）
+// ============================================================
+
+/**
+ * 判断点 (px, py) 是否位于板内（落在任一 cell 内即视为在板内）
+ */
+export function isPointInPlank(px: number, py: number, plank: PlankSpec): boolean {
+  for (const cell of plank.cells) {
+    const cx = plank.origin.x + cell.x;
+    const cy = plank.origin.y + cell.y;
+    if (
+      px >= cx - cell.w / 2 &&
+      px <= cx + cell.w / 2 &&
+      py >= cy - cell.h / 2 &&
+      py <= cy + cell.h / 2
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 板的世界包围盒（用于绘制范围、相机/HUD 安全区判断）
+ */
+export function getPlankBoundingBox(plank: PlankSpec): {
+  minX: number; minY: number; maxX: number; maxY: number;
+} {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const c of plank.cells) {
+    const cx = plank.origin.x + c.x;
+    const cy = plank.origin.y + c.y;
+    minX = Math.min(minX, cx - c.w / 2);
+    minY = Math.min(minY, cy - c.h / 2);
+    maxX = Math.max(maxX, cx + c.w / 2);
+    maxY = Math.max(maxY, cy + c.h / 2);
+  }
+  return { minX, minY, maxX, maxY };
 }

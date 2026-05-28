@@ -1,11 +1,12 @@
 /**
- * 拧丝 AI · 木板与螺丝管理器（替换原 CardManager）
+ * 拧丝 AI · 木板与螺丝管理器（v1.1）
  *
- * 职责：
- * - 根据 LevelConfig 绘制木板 + 螺丝
- * - 处理螺丝点击（带 100ms 防误触）
- * - 计算"被上层木板遮挡"的螺丝（不可点 + 灰度）
- * - 螺丝被拧出时：detach 到 BoardRoot（保持世界坐标），由 SlotManager 接管飞行动画
+ * 变更点（vs v1.0）：
+ * - 木板用 cells（矩形单元集合）绘制，支持 L / T / 十字 / 矩形等形状
+ * - 螺丝节点挂在 BoardRoot 下（不再是板的子节点），位置用屏幕本地绝对坐标
+ * - 一颗螺丝可穿透多块板（plankIds），所有穿透板都要从未拧螺丝列表中移除
+ * - 当一块板的"未拧螺丝列表"清空 → 触发板掉落动画 → 销毁板 → recheckClickable
+ * - 遮挡判定：螺丝可点 ⇔ 没有任何 layer > 它当前最顶层穿透板 layer 的板覆盖到它的坐标
  */
 
 import {
@@ -26,17 +27,19 @@ import {
   LevelConfig,
   PlankSpec,
   PlankStyle,
+  RectCell,
   ScrewColor,
   ScrewSpec,
+  isPointInPlank,
 } from './LevelTypes';
 import { prepUiNode } from './UiUtil';
 
 const { ccclass } = _decorator;
 
-const SCREW_DIAMETER = 50;
+const SCREW_DIAMETER = 48;
 const TAP_DEBOUNCE_MS = 100; // 见 SPEC U-1
+const PLANK_DROP_DURATION = 0.45;
 
-/** 解析十六进制 → cc.Color */
 function hexToColor(hex: string, alpha = 255): Color {
   const h = hex.replace('#', '');
   const r = parseInt(h.substring(0, 2), 16);
@@ -60,22 +63,30 @@ const PLANK_BORDER: Record<PlankStyle, Color> = {
 interface BoardScrewRuntime {
   spec: ScrewSpec;
   node: Node;
-  /** 屏幕本地坐标（板心 + 孔偏移） */
-  worldLocalX: number;
-  worldLocalY: number;
-  /** 当前是否可点（被上层板遮挡时为 false） */
+  /** 屏幕本地绝对坐标（与 spec.x/y 一致，缓存为字段方便遮挡运算） */
+  worldX: number;
+  worldY: number;
+  /** 当前是否可点 */
   clickable: boolean;
   removed: boolean;
   lastTapMs: number;
+}
+
+interface PlankRuntime {
+  spec: PlankSpec;
+  node: Node;
+  /** 该板"未拧螺丝"的 ID 集合 */
+  remainingScrews: Set<number>;
+  /** 是否正在掉落 / 已掉落 */
+  dropped: boolean;
 }
 
 @ccclass('BoardManager')
 export class BoardManager extends Component {
   private game!: GameManager;
   private boardRoot!: Node;
-  private planks: PlankSpec[] = [];
+  private planks = new Map<number, PlankRuntime>();
   private screws: BoardScrewRuntime[] = [];
-  private plankNodes = new Map<number, Node>();
 
   bindGame(game: GameManager) {
     this.game = game;
@@ -88,37 +99,44 @@ export class BoardManager extends Component {
   buildLevel(config: LevelConfig) {
     this.ensureRoots();
     this.clearAll();
-    this.planks = config.planks.slice();
 
-    // 1. 绘制木板（按 layer 升序，layer 大者后渲染 = 视觉上"在上")
+    // 1. 绘制木板（按 layer 升序入场，layer 大者后渲染 = 视觉在上）
     const planksOrdered = [...config.planks].sort((a, b) => a.layer - b.layer);
     for (const plank of planksOrdered) {
       const node = this.createPlankNode(plank);
       node.setParent(this.boardRoot);
-      node.setPosition(plank.x, plank.y, 0);
-      node.setSiblingIndex(100 + plank.layer); // layer 大者在前
-      this.plankNodes.set(plank.id, node);
+      node.setPosition(plank.origin.x, plank.origin.y, 0);
+      node.setSiblingIndex(100 + plank.layer);
+      this.planks.set(plank.id, {
+        spec: plank,
+        node,
+        remainingScrews: new Set<number>(),
+        dropped: false,
+      });
     }
 
-    // 2. 绘制螺丝（作为对应木板的子节点）
+    // 2. 绘制螺丝（挂在 BoardRoot 下，绝对坐标）
     for (const screwSpec of config.screws) {
-      const plank = this.planks.find((p) => p.id === screwSpec.plankId)!;
-      const hole = plank.holeOffsets[screwSpec.holeIndex];
-      const parentNode = this.plankNodes.get(plank.id)!;
-
       const node = this.createScrewNode(screwSpec);
-      node.setParent(parentNode);
-      node.setPosition(hole.dx, hole.dy, 0);
+      node.setParent(this.boardRoot);
+      node.setPosition(screwSpec.x, screwSpec.y, 0);
+      node.setSiblingIndex(10000 + screwSpec.id); // 螺丝永远在木板上方
 
       this.screws.push({
         spec: screwSpec,
         node,
-        worldLocalX: plank.x + hole.dx,
-        worldLocalY: plank.y + hole.dy,
+        worldX: screwSpec.x,
+        worldY: screwSpec.y,
         clickable: false,
         removed: false,
         lastTapMs: 0,
       });
+
+      // 把这颗螺丝挂到它穿透的所有板的 remainingScrews 上
+      for (const pid of screwSpec.plankIds) {
+        const pr = this.planks.get(pid);
+        if (pr) pr.remainingScrews.add(screwSpec.id);
+      }
     }
 
     this.recheckClickable();
@@ -133,24 +151,24 @@ export class BoardManager extends Component {
     }
   }
 
-  /** 一颗螺丝是否被任何 layer 更高的木板矩形覆盖 */
+  /**
+   * 一颗螺丝是否被覆盖：
+   *   存在任意一块"未掉落且 layer 大于该螺丝当前最顶层穿透板 layer"的板，
+   *   且这块板的 cells 任意一个矩形覆盖到螺丝坐标 → 视为被遮挡
+   */
   private isOccluded(screw: BoardScrewRuntime): boolean {
-    const selfPlank = this.planks.find((p) => p.id === screw.spec.plankId)!;
-    for (const other of this.planks) {
-      if (other.layer <= selfPlank.layer) continue; // 上方层才可能遮挡
-      // 因为某个 layer 上的木板可能已经被全拧光并被消除？MVP 阶段不会删除木板，但保留接口
-      const left = other.x - other.w / 2;
-      const right = other.x + other.w / 2;
-      const bottom = other.y - other.h / 2;
-      const top = other.y + other.h / 2;
-      if (
-        screw.worldLocalX >= left &&
-        screw.worldLocalX <= right &&
-        screw.worldLocalY >= bottom &&
-        screw.worldLocalY <= top
-      ) {
-        return true;
-      }
+    // 该螺丝当前实际仍存在的穿透板（已掉落的板忽略）
+    const alivePiercedLayers = screw.spec.plankIds
+      .map((pid) => this.planks.get(pid))
+      .filter((pr) => pr && !pr.dropped)
+      .map((pr) => pr!.spec.layer);
+    if (alivePiercedLayers.length === 0) return false; // 所有穿透板都掉了，理论上不会发生（螺丝早被拧走）
+    const selfMaxLayer = Math.max(...alivePiercedLayers);
+
+    for (const pr of this.planks.values()) {
+      if (pr.dropped) continue;
+      if (pr.spec.layer <= selfMaxLayer) continue;
+      if (isPointInPlank(screw.worldX, screw.worldY, pr.spec)) return true;
     }
     return false;
   }
@@ -159,12 +177,11 @@ export class BoardManager extends Component {
     return this.screws.every((s) => s.removed);
   }
 
-  /** 道具：洗牌剩余螺丝的颜色（位置不变，重新随机分配颜色） */
+  /** 道具预留：洗牌剩余螺丝颜色 */
   shuffleRemaining() {
     const alive = this.screws.filter((s) => !s.removed);
     if (alive.length < 2) return;
     const colors = alive.map((s) => s.spec.color);
-    // shuffle in place
     for (let i = colors.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [colors[i], colors[j]] = [colors[j], colors[i]];
@@ -176,12 +193,11 @@ export class BoardManager extends Component {
   }
 
   clearAll() {
-    this.planks = [];
+    this.planks.forEach((pr) => pr.node?.destroy());
+    this.planks.clear();
+    for (const s of this.screws) s.node?.destroy();
     this.screws = [];
-    this.plankNodes.forEach((n) => n.destroy());
-    this.plankNodes.clear();
     if (this.boardRoot?.isValid) {
-      // 兜底：清掉残留
       for (const child of this.boardRoot.children.slice()) {
         if (/^Plank_\d+$/.test(child.name) || /^Screw_\d+$/.test(child.name)) {
           child.destroy();
@@ -191,14 +207,16 @@ export class BoardManager extends Component {
   }
 
   // ============================================================
-  // 节点创建
+  // 节点创建 / 绘制
   // ============================================================
 
   private createPlankNode(plank: PlankSpec): Node {
     const node = new Node(`Plank_${plank.id}`);
     prepUiNode(node);
+    // 板的 UITransform 用包围盒尺寸（便于布局/调试）
     const ui = node.addComponent(UITransform);
-    ui.setContentSize(plank.w, plank.h);
+    const bbox = this.getPlankBBox(plank.cells);
+    ui.setContentSize(bbox.w, bbox.h);
 
     const g = node.addComponent(Graphics);
     this.drawPlank(g, plank);
@@ -206,33 +224,50 @@ export class BoardManager extends Component {
     return node;
   }
 
+  private getPlankBBox(cells: RectCell[]): { w: number; h: number } {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const c of cells) {
+      minX = Math.min(minX, c.x - c.w / 2);
+      minY = Math.min(minY, c.y - c.h / 2);
+      maxX = Math.max(maxX, c.x + c.w / 2);
+      maxY = Math.max(maxY, c.y + c.h / 2);
+    }
+    return { w: maxX - minX, h: maxY - minY };
+  }
+
+  /** 把若干轴对齐矩形 cell 用 Graphics 绘制成"看起来像一整块板" */
   private drawPlank(g: Graphics, plank: PlankSpec) {
-    const w = plank.w;
-    const h = plank.h;
     const fill = PLANK_FILLS[plank.style];
     const border = PLANK_BORDER[plank.style];
+    const innerShade = new Color(border.r, border.g, border.b, 90);
 
-    // 主体（圆角矩形）
+    // 1. 先把所有 cell 用 fillColor 实心填一遍（圆角矩形，重叠区会自然合并）
     g.fillColor = fill;
-    g.roundRect(-w / 2, -h / 2, w, h, 18);
-    g.fill();
+    for (const c of plank.cells) {
+      g.roundRect(c.x - c.w / 2, c.y - c.h / 2, c.w, c.h, 14);
+      g.fill();
+    }
 
-    // 边框
-    g.lineWidth = 4;
-    g.strokeColor = border;
-    g.roundRect(-w / 2, -h / 2, w, h, 18);
-    g.stroke();
-
-    // 木纹（3 条水平细线）
+    // 2. 木纹（每个 cell 内画 2 条横线）
     g.lineWidth = 2;
-    g.strokeColor = new Color(border.r, border.g, border.b, 100);
-    const lines = 3;
-    for (let i = 1; i <= lines; i++) {
-      const y = -h / 2 + (h / (lines + 1)) * i;
-      g.moveTo(-w / 2 + 16, y);
-      g.lineTo(w / 2 - 16, y);
+    g.strokeColor = innerShade;
+    for (const c of plank.cells) {
+      const lines = c.h > 120 ? 3 : 2;
+      for (let i = 1; i <= lines; i++) {
+        const ly = c.y - c.h / 2 + (c.h / (lines + 1)) * i;
+        g.moveTo(c.x - c.w / 2 + 14, ly);
+        g.lineTo(c.x + c.w / 2 - 14, ly);
+      }
     }
     g.stroke();
+
+    // 3. 每个 cell 描一圈边框（重叠处会有"内骨架"效果，更接近真实板感）
+    g.lineWidth = 3;
+    g.strokeColor = border;
+    for (const c of plank.cells) {
+      g.roundRect(c.x - c.w / 2, c.y - c.h / 2, c.w, c.h, 14);
+      g.stroke();
+    }
   }
 
   private createScrewNode(spec: ScrewSpec): Node {
@@ -244,7 +279,6 @@ export class BoardManager extends Component {
     const g = node.addComponent(Graphics);
     this.drawScrew(g, spec.color, true);
 
-    // 点击事件（在自己节点上即可）
     node.on(Node.EventType.TOUCH_END, (e: EventTouch) => this.onScrewTap(spec.id, e), this);
     return node;
   }
@@ -258,7 +292,6 @@ export class BoardManager extends Component {
       ? new Color(Math.max(0, base.r - 60), Math.max(0, base.g - 60), Math.max(0, base.b - 60), 255)
       : new Color(80, 80, 80, 200);
 
-    // 外圈金属感
     g.fillColor = fill;
     g.circle(0, 0, r);
     g.fill();
@@ -267,7 +300,6 @@ export class BoardManager extends Component {
     g.circle(0, 0, r);
     g.stroke();
 
-    // 十字凹槽
     const slot = r * 0.42;
     g.lineWidth = 4;
     g.strokeColor = clickable
@@ -279,7 +311,6 @@ export class BoardManager extends Component {
     g.lineTo(0, slot);
     g.stroke();
 
-    // 高光小点（可点击时更亮）
     if (clickable) {
       g.fillColor = new Color(255, 255, 255, 180);
       g.circle(-r * 0.35, r * 0.35, r * 0.14);
@@ -315,7 +346,6 @@ export class BoardManager extends Component {
     const s = this.screws.find((x) => x.spec.id === screwId);
     if (!s || s.removed || !s.clickable) return;
 
-    // 防误触（SPEC U-1）
     const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
     if (now - s.lastTapMs < TAP_DEBOUNCE_MS) return;
     s.lastTapMs = now;
@@ -323,21 +353,56 @@ export class BoardManager extends Component {
     if (!this.game?.canAcceptScrewTap()) return;
 
     s.removed = true;
-    // detach 到 BoardRoot（保持视觉位置不跳），等 SlotManager 接管
-    s.node.off(Node.EventType.TOUCH_END);
-    s.node.setParent(this.boardRoot, true);
-    s.node.setSiblingIndex(9999);
 
-    // 拧出小动画：旋转 + 上飘 + 缩放
+    // 从所有穿透板的 remainingScrews 中移除
+    const plankIdsToCheckDrop: number[] = [];
+    for (const pid of s.spec.plankIds) {
+      const pr = this.planks.get(pid);
+      if (!pr || pr.dropped) continue;
+      pr.remainingScrews.delete(s.spec.id);
+      if (pr.remainingScrews.size === 0) plankIdsToCheckDrop.push(pid);
+    }
+
+    // 螺丝节点已挂在 BoardRoot 下（绝对坐标），直接播飞出动画
+    s.node.off(Node.EventType.TOUCH_END);
+    s.node.setSiblingIndex(99999);
+
     tween(s.node)
       .by(0.18, { angle: 360, position: new Vec3(0, 30, 0), scale: new Vec3(0.1, 0.1, 0) }, { easing: 'sineOut' })
       .start();
 
-    // 立即上报给 GameManager，由其转交 SlotManager（保证响应感）
+    // 立即上报 GameManager（飞入颜色槽 + 胜负判定）
     this.game.onScrewPicked(s.node, s.spec.color);
 
-    // 重算遮挡（被这颗螺丝的板子下方的螺丝可能因此变可点 - MVP 阶段木板未消失，无变化；预留接口）
+    // 触发空板掉落（异步，掉完会 recheckClickable）
+    for (const pid of plankIdsToCheckDrop) {
+      this.dropPlank(pid);
+    }
+
+    // 螺丝拧出后立刻 recheckClickable（在板掉落动画播放期间也有变化）
     this.recheckClickable();
+  }
+
+  /** 当一块板的所有螺丝都拧光：播放下落+缩小+渐隐 → 销毁 → 重算遮挡 */
+  private dropPlank(plankId: number) {
+    const pr = this.planks.get(plankId);
+    if (!pr || pr.dropped) return;
+    pr.dropped = true;
+
+    const op = pr.node.getComponent(UIOpacity) ?? pr.node.addComponent(UIOpacity);
+
+    tween(pr.node)
+      .by(PLANK_DROP_DURATION, { position: new Vec3(0, -200, 0), scale: new Vec3(-0.15, -0.15, 0) }, { easing: 'quadIn' })
+      .start();
+
+    tween(op)
+      .to(PLANK_DROP_DURATION, { opacity: 0 }, { easing: 'quadIn' })
+      .call(() => {
+        if (pr.node?.isValid) pr.node.destroy();
+        // 板已彻底消失，重算遮挡（下层螺丝可能变可点）
+        this.recheckClickable();
+      })
+      .start();
   }
 
   // ============================================================
