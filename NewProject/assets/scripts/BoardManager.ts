@@ -16,6 +16,7 @@ import {
   EventTouch,
   Graphics,
   Node,
+  Sprite,
   UIOpacity,
   UITransform,
   Vec3,
@@ -33,6 +34,7 @@ import {
   isPointInPlank,
 } from './LevelTypes';
 import { prepUiNode } from './UiUtil';
+import { AssetLoader } from './AssetLoader';
 
 const { ccclass } = _decorator;
 
@@ -58,6 +60,13 @@ const PLANK_BORDER: Record<PlankStyle, Color> = {
   [PlankStyle.Light]: hexToColor('#8B6238'),
   [PlankStyle.Mid]: hexToColor('#6B4A26'),
   [PlankStyle.Dark]: hexToColor('#4A2D14'),
+};
+
+/** 木纹贴图(浅米色)的染色 tint（multiply）：三档木色深浅 */
+const PLANK_TINT: Record<PlankStyle, Color> = {
+  [PlankStyle.Light]: new Color(255, 236, 205, 255),
+  [PlankStyle.Mid]: new Color(214, 168, 120, 255),
+  [PlankStyle.Dark]: new Color(150, 110, 70, 255),
 };
 
 interface BoardScrewRuntime {
@@ -218,8 +227,27 @@ export class BoardManager extends Component {
     const bbox = this.getPlankBBox(plank.cells);
     ui.setContentSize(bbox.w, bbox.h);
 
-    const g = node.addComponent(Graphics);
-    this.drawPlank(g, plank);
+    const tile = AssetLoader.get('plankTile');
+    if (tile) {
+      // 有图：每个 cell 贴一张九宫格木纹 Sprite，cells 并集即板形状
+      const tint = PLANK_TINT[plank.style];
+      for (const c of plank.cells) {
+        const cellNode = new Node('Cell');
+        prepUiNode(cellNode);
+        cellNode.setParent(node);
+        cellNode.setPosition(c.x, c.y, 0);
+        cellNode.addComponent(UITransform).setContentSize(c.w, c.h);
+        const sp = cellNode.addComponent(Sprite);
+        sp.spriteFrame = tile;
+        sp.type = Sprite.Type.SLICED; // 九宫格（border 在编辑器里设）
+        sp.sizeMode = Sprite.SizeMode.CUSTOM;
+        sp.color = tint;
+      }
+    } else {
+      // 无图：回退 Graphics 绘制
+      const g = node.addComponent(Graphics);
+      this.drawPlank(g, plank);
+    }
 
     return node;
   }
@@ -276,8 +304,19 @@ export class BoardManager extends Component {
     const ui = node.addComponent(UITransform);
     ui.setContentSize(SCREW_DIAMETER, SCREW_DIAMETER);
 
-    const g = node.addComponent(Graphics);
-    this.drawScrew(g, spec.color, true);
+    const sf = AssetLoader.get('screw');
+    if (sf) {
+      // 有图：白色螺丝贴图 × 顶点色 = 染色螺丝
+      const sp = node.addComponent(Sprite);
+      sp.spriteFrame = sf;
+      sp.type = Sprite.Type.SIMPLE;
+      sp.sizeMode = Sprite.SizeMode.CUSTOM;
+      sp.color = hexToColor(COLOR_HEX[spec.color]);
+    } else {
+      // 无图：回退 Graphics 绘制
+      const g = node.addComponent(Graphics);
+      this.drawScrew(g, spec.color, true);
+    }
 
     node.on(Node.EventType.TOUCH_END, (e: EventTouch) => this.onScrewTap(spec.id, e), this);
     return node;
@@ -319,9 +358,15 @@ export class BoardManager extends Component {
   }
 
   private applyScrewVisual(s: BoardScrewRuntime) {
-    const g = s.node.getComponent(Graphics);
-    if (!g) return;
-    this.drawScrew(g, s.spec.color, s.clickable);
+    const sp = s.node.getComponent(Sprite);
+    if (sp) {
+      // Sprite 版：顶点色染色，不可点时压暗
+      const base = hexToColor(COLOR_HEX[s.spec.color]);
+      sp.color = s.clickable ? base : this.dimDesat(base, 0.55, 0.5);
+    } else {
+      const g = s.node.getComponent(Graphics);
+      if (g) this.drawScrew(g, s.spec.color, s.clickable);
+    }
     const op = s.node.getComponent(UIOpacity) ?? s.node.addComponent(UIOpacity);
     op.opacity = s.clickable ? 255 : 180;
   }

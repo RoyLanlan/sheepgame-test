@@ -23,6 +23,7 @@ import { BackgroundLayer } from './BackgroundLayer';
 import { generateLevel, getMaxLevel } from './LevelGenerator';
 import { narrate, pickFailEncourage } from './AiNarrator';
 import { Storage, StorageKeys } from './Storage';
+import { AssetLoader } from './AssetLoader';
 import { LevelConfig, LevelNarrative, PlayerHistory, ScrewColor, emptyHistory } from './LevelTypes';
 import type { Node } from 'cc';
 
@@ -137,8 +138,12 @@ export class GameManager extends Component {
 
     this.currentConfig = generateLevel(this.levelIndex, this.history);
 
-    // AI 叙事预拉（异步，本地兜底瞬时返回）
-    this.currentNarrative = await narrate(this.currentConfig);
+    // 并行：预加载美术资源(缺图自动回退 Graphics) + AI 叙事(本地兜底瞬时返回)
+    const [, narrative] = await Promise.all([
+      AssetLoader.preloadAll(),
+      narrate(this.currentConfig),
+    ]);
+    this.currentNarrative = narrative;
 
     // 真正建关卡
     this.slotManager.resetSlots();
